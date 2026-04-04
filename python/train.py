@@ -1387,6 +1387,15 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
     else:
         running_metrics["weights"] = defaultdict(float,running_metrics["weights"])
 
+    # If nsamp isn't in the running metrics (e.g. loading from an initial checkpoint that
+    # doesn't include running metrics), seed it from the train state so it continues from
+    # the right sample count rather than restarting at 0.
+    if "nsamp" not in running_metrics["sums"] and "global_step_samples" in train_state:
+        global_step_samples_initial = train_state["global_step_samples"]
+        running_metrics["sums"]["nsamp"] = global_step_samples_initial
+        running_metrics["weights"]["nsamp"] = global_step_samples_initial
+        logging.info(f"Seeded running_metrics nsamp from train_state global_step_samples: {global_step_samples_initial}")
+
     torch.backends.cudnn.benchmark = True
     trainloop_helpers.maybe_enable_compiled_autograd()
 
