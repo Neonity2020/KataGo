@@ -67,7 +67,7 @@ else
            -approx-rows-per-out-file 70000 \
            -num-processes "$NTHREADS" \
            -keep-target-rows 20000000 \
-           -only-include-md5-path-prop-lbound 0.95 \
+           -only-include-md5-path-prop-lbound 0.99 \
            -only-include-md5-path-prop-ubound 1.00 \
            "$@" \
            2>&1 | tee "$BASEDIR"/shuffleddata/"$OUTDIR".tmp/outval.txt &
@@ -85,7 +85,7 @@ else
            -num-processes "$NTHREADS" \
            -keep-target-rows 20000000 \
            -only-include-md5-path-prop-lbound 0.00 \
-           -only-include-md5-path-prop-ubound 0.95 \
+           -only-include-md5-path-prop-ubound 0.99 \
            "$@" \
            2>&1 | tee "$BASEDIR"/shuffleddata/"$OUTDIR".tmp/outtrain.txt &
 
