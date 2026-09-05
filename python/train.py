@@ -130,6 +130,7 @@ if __name__ == "__main__":
     optional_args.add_argument('-data-prefetch-depth', help='Number of training data files to prefetch ahead of the one being consumed, to hide disk+decompress latency at file boundaries. Memory scales linearly with this (each in-flight file holds its full expanded arrays in RAM, per rank).', type=int, default=1, required=False)
     optional_args.add_argument('-randomize-val', help='Randomize order of validation files', required=False, action='store_true')
     optional_args.add_argument('-no-export', help='Do not export models', required=False, action='store_true')
+    optional_args.add_argument('-no-longterm-checkpoints', help='Do not save the periodic archival checkpoints in longterm_checkpoints/', required=False, action='store_true')
     optional_args.add_argument('-no-repeat-files', help='Track what shuffled data was used and do not repeat, even when killed and resumed', required=False, action='store_true')
     optional_args.add_argument('-quit-if-no-data', help='If no data, quit instead of waiting for data', required=False, action='store_true')
 
@@ -404,6 +405,7 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
     randomize_val = args["randomize_val"]
     data_prefetch_depth = args["data_prefetch_depth"]
     no_export = args["no_export"]
+    no_longterm_checkpoints = args["no_longterm_checkpoints"]
     no_repeat_files = args["no_repeat_files"]
     quit_if_no_data = args["quit_if_no_data"]
 
@@ -1961,7 +1963,7 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
         else:
             time.sleep(sleep_seconds_per_epoch)
 
-        if rank == 0:
+        if rank == 0 and not no_longterm_checkpoints:
             now = datetime.datetime.now()
             if now - last_longterm_checkpoint_save_time >= datetime.timedelta(hours=12):
                 last_longterm_checkpoint_save_time = now
