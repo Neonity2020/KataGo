@@ -124,6 +124,7 @@ if __name__ == "__main__":
     optional_args.add_argument('-sleep-seconds-per-epoch', help='Sleep this long between epochs', type=int, required=False)
     optional_args.add_argument('-max-train-bucket-per-new-data', help='When data added, add this many train rows per data row to bucket', type=float, required=False)
     optional_args.add_argument('-max-train-bucket-size', help='Approx total number of train rows allowed if data stops', type=float, required=False)
+    optional_args.add_argument('-initial-train-bucket-level', help='Train rows initially in the bucket when the checkpoint has no bucket state yet, default samples-per-epoch. No effect once the checkpoint has a bucket.', type=float, required=False)
     optional_args.add_argument('-max-train-steps-since-last-reload', help='Approx total of training allowed if shuffling stops', type=float, required=False)
     optional_args.add_argument('-stop-when-train-bucket-limited', help='Terminate due to train bucket rather than waiting for more', required=False, action='store_true')
     optional_args.add_argument('-max-val-samples', help='Approx max of validation samples per epoch', type=int, required=False)
@@ -399,6 +400,7 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
     sleep_seconds_per_epoch = args["sleep_seconds_per_epoch"]
     max_train_bucket_per_new_data = args["max_train_bucket_per_new_data"]
     max_train_bucket_size = args["max_train_bucket_size"]
+    initial_train_bucket_level = args["initial_train_bucket_level"]
     max_train_steps_since_last_reload = args["max_train_steps_since_last_reload"]
     stop_when_train_bucket_limited = args["stop_when_train_bucket_limited"]
     max_val_samples = args["max_val_samples"]
@@ -1023,7 +1025,11 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
     if "global_step_samples" not in train_state:
         train_state["global_step_samples"] = 0
     if max_train_bucket_per_new_data is not None and "train_bucket_level" not in train_state:
-        train_state["train_bucket_level"] = samples_per_epoch
+        if initial_train_bucket_level is not None:
+            train_state["train_bucket_level"] = initial_train_bucket_level
+        else:
+            train_state["train_bucket_level"] = samples_per_epoch
+        logging.info("Checkpoint has no train bucket state, initial bucket level %.0f" % train_state["train_bucket_level"])
     if "train_steps_since_last_reload" not in train_state:
         train_state["train_steps_since_last_reload"] = 0
     if "export_cycle_counter" not in train_state:
