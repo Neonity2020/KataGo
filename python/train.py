@@ -260,7 +260,11 @@ def multiprocessing_setup(rank: int, world_size: int):
     if 'MASTER_PORT' not in os.environ or not os.environ['MASTER_PORT']:
         os.environ['MASTER_PORT'] = '23456'
     logging.info("Running torch.distributed.init_process_group")
-    torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size)
+    # Ranks can reach their first collective many minutes apart, for example when one rank hits a
+    # warm torch.compile cache and another does not, or when data loading is slowed by other work
+    # on the machine. The default NCCL watchdog of about ten minutes then kills the run, so allow
+    # a much longer wait. A truly hung collective is still detected, just later.
+    torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size, timeout=datetime.timedelta(hours=1))
     logging.info(f"Returned from torch.distributed.init_process_group, my rank = {rank}, world_size={world_size}")
 
 def multiprocessing_cleanup():
@@ -667,7 +671,10 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                     if os.path.exists(get_checkpoint_prev_path(i)):
                         os.replace(get_checkpoint_prev_path(i), get_checkpoint_prev_path(i+1))
                 if os.path.exists(get_checkpoint_path()):
-                    shutil.copy(get_checkpoint_path(), get_checkpoint_prev_path(0))
+                    # Copy under a temporary name and rename so that a reader such as a backup
+                    # rsync never sees a partially written checkpoint_prev0.ckpt.
+                    shutil.copy(get_checkpoint_path(), get_checkpoint_prev_path(0) + ".tmp")
+                    os.replace(get_checkpoint_prev_path(0) + ".tmp", get_checkpoint_prev_path(0))
                 torch.save(state_dict, get_checkpoint_path() + ".tmp")
                 os.replace(get_checkpoint_path() + ".tmp", get_checkpoint_path())
 
