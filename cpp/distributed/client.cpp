@@ -646,6 +646,7 @@ bool Connection::retryLoop(const char* errorLabel, int maxTries, std::function<b
   const double initialFailureInterval = 5.0;
 
   double failureInterval = initialFailureInterval;
+  bool anyFailure = false;
   for(int i = 0; i<maxTries; i++) {
     int loopFailMode = LOOP_RETRYABLE_FAIL;
     try {
@@ -654,10 +655,12 @@ bool Connection::retryLoop(const char* errorLabel, int maxTries, std::function<b
     catch(const StringError& e) {
       if(shouldStop())
         return false;
+      anyFailure = true;
 
-      //Reset everything on partial success
+      //Reset everything on partial success. The continue below runs the loop increment, so
+      //set -1 here for the next try to be counted as try 0 again.
       if(loopFailMode == LOOP_PARTIAL_SUCCESS || loopFailMode == LOOP_PARTIAL_SUCCESS_NO_LOG) {
-        i = 0;
+        i = -1;
         failureInterval = initialFailureInterval;
       }
       else {
@@ -670,7 +673,7 @@ bool Connection::retryLoop(const char* errorLabel, int maxTries, std::function<b
         throw;
 
       if(loopFailMode != LOOP_PARTIAL_SUCCESS_NO_LOG) {
-        logger->write(string(errorLabel) + ": Error connecting to server, possibly an internet blip, or possibly the server is down or temporarily misconfigured, waiting about " + Global::doubleToString(failureInterval) + " seconds and trying again.");
+        logger->write(string(errorLabel) + ": Attempt failed, waiting about " + Global::doubleToString(failureInterval) + " seconds and trying again. If this keeps happening, it may be an internet blip, or the server may be down or temporarily misconfigured.");
         logger->write(string("Error was:\n") + e.what());
       }
 
@@ -692,7 +695,7 @@ bool Connection::retryLoop(const char* errorLabel, int maxTries, std::function<b
         failureInterval = 7200;
       continue;
     }
-    if(i > 0)
+    if(anyFailure)
       logger->write(string(errorLabel) + ": Connection to server is back!");
     break;
   }
@@ -933,8 +936,10 @@ bool Connection::downloadModelIfNotPresent(
 
   const string path = getModelPath(modelInfo,modelDir);
 
-  std::unique_lock<std::mutex> lock(downloadStateMutex);
   while(true) {
+    //Acquired fresh on every iteration. The cleanup guard below releases it at the end of an
+    //iteration in which we downloaded, so the lock must not outlive the iteration.
+    std::unique_lock<std::mutex> lock(downloadStateMutex);
     //Model already exists
     if(FileUtils::exists(path))
       return true;
@@ -953,6 +958,8 @@ bool Connection::downloadModelIfNotPresent(
         }
         logger->write("Woke up, other thread finished downloading model");
         //Sleep a little while and then try again to see if we still need to download the model.
+        //Release the lock first so that other threads are not blocked during the sleep.
+        lock.unlock();
         std::this_thread::sleep_for(std::chrono::duration<double>(2.0));
         continue;
       }
@@ -1012,6 +1019,17 @@ bool Connection::actuallyDownloadModel(
     ofstream out;
     FileUtils::open(out,tmpPath,ios::binary);
 
+    //Remove the partial or unverified file on any exit other than a successful rename, so that
+    //failed attempts do not leave files behind in the model directory.
+    bool tmpFileRenamed = false;
+    auto removeTmpFile = [&]() {
+      if(!tmpFileRenamed) {
+        out.close();
+        FileUtils::tryRemoveFile(tmpPath);
+      }
+    };
+    Global::CustomScopeGuard<decltype(removeTmpFile)> tmpFileGuard(std::move(removeTmpFile));
+
     ClockTimer timer;
     double lastTime = timer.getSeconds();
 
@@ -1034,12 +1052,12 @@ bool Connection::actuallyDownloadModel(
           "Model download received more bytes than the model contains, discarding partial download and restarting from the beginning"
         );
       }
+      if(totalDataSize == modelInfo.bytes)
+        return;
       //If we already learned that the server will not honor Range headers, resuming is not
       //possible at all, so any partial data must be thrown away and downloaded in one piece.
       if(serverIgnoresRange && totalDataSize > 0)
         restartFromBeginning();
-      if(totalDataSize == modelInfo.bytes)
-        return;
       const size_t oldTotalDataSize = totalDataSize;
       const size_t startByte = oldTotalDataSize;
       const size_t endByte = modelInfo.bytes-1;
@@ -1054,7 +1072,19 @@ bool Connection::actuallyDownloadModel(
       //the server ignored Range.
       string responseHeaderError;
       bool disableRangeResume = false;
+      bool sizeMismatchFatal = false;
       httplib::ResponseHandler responseHandler = [&](const httplib::Response& headerResponse) {
+        if(requestResume && headerResponse.status == 416) {
+          //We only ever ask for bytes below the size the server told us the file has, so a
+          //416 means the file on the server is smaller than that. Resuming again cannot fix
+          //this, so stop the inner loop and leave it to the outer loop whether to start over.
+          sizeMismatchFatal = true;
+          responseHeaderError =
+            "Server gave response status code 416 Range Not Satisfiable when resuming at byte " +
+            Global::uint64ToString(startByte) + ", the model file on the server is smaller than the expected " +
+            Global::uint64ToString(modelInfo.bytes) + " bytes";
+          return false;
+        }
         if(headerResponse.status != 200 && headerResponse.status != 206) {
           ostringstream outs;
           outs << "Server gave response status code " << headerResponse.status << " instead of 200 OK or 206 Partial Content";
@@ -1072,7 +1102,9 @@ bool Connection::actuallyDownloadModel(
           return false;
         }
 
-        if(requestResume && headerResponse.status == 206) {
+        //A 206 must say which bytes it carries, and they must start where we are. This is checked
+        //even when we did not ask for a range, in case a broken server or cache sends one anyway.
+        if(headerResponse.status == 206) {
           string contentRange;
           for(const auto& header : headerResponse.headers) {
             if(Global::toLower(header.first) == "content-range")
@@ -1080,11 +1112,11 @@ bool Connection::actuallyDownloadModel(
           }
           const string expectedPrefix = string("bytes ") + Global::uint64ToString(startByte) + "-";
           if(contentRange == "" || Global::toLower(contentRange).rfind(expectedPrefix,0) != 0) {
-            disableRangeResume = true;
+            disableRangeResume = requestResume;
             responseHeaderError =
               "Server returned 206 Partial Content with " +
               (contentRange == "" ? string("no Content-Range header") : string("unexpected Content-Range \"") + contentRange + "\"") +
-              ", discarding partial download and restarting from the beginning";
+              ", discarding any partial download and restarting from the beginning";
             return false;
           }
         }
@@ -1115,6 +1147,8 @@ bool Connection::actuallyDownloadModel(
         throw StringError("Stopping because shouldStop is true");
 
       if(responseHeaderError != "") {
+        if(sizeMismatchFatal)
+          innerLoopFailMode = LOOP_FATAL_FAIL;
         if(disableRangeResume) {
           serverIgnoresRange = true;
           restartFromBeginning();
@@ -1123,6 +1157,15 @@ bool Connection::actuallyDownloadModel(
       }
 
       if(totalDataSize > modelInfo.bytes) {
+        if(!requestResume) {
+          //A full response with more bytes than the server said the file has means the server's
+          //metadata does not match its file. Requesting again within this attempt cannot fix
+          //this, so stop the inner loop and leave it to the outer loop whether to start over.
+          innerLoopFailMode = LOOP_FATAL_FAIL;
+          throw StringError(
+            "Model file was larger than expected, got more than " + Global::uint64ToString(modelInfo.bytes) + " bytes"
+          );
+        }
         restartFromBeginning();
         throw StringError(
           "Model download received more bytes than the model contains, discarding partial download and restarting from the beginning"
@@ -1148,13 +1191,6 @@ bool Connection::actuallyDownloadModel(
           "Model file was incompletely downloaded, only got " + Global::int64ToString(totalDataSize) +
           " bytes out of " + Global::uint64ToString(modelInfo.bytes)
         );
-      if(totalDataSize > modelInfo.bytes) {
-        innerLoopFailMode = LOOP_FATAL_FAIL;
-        throw StringError(
-          "Model file was larger than expected, got " + Global::int64ToString(totalDataSize) +
-          " bytes out of " + Global::uint64ToString(modelInfo.bytes)
-        );
-      }
     };
     retryLoop("downloadModel",DEFAULT_MAX_TRIES,shouldStop,fInner);
     out.close();
@@ -1175,7 +1211,17 @@ bool Connection::actuallyDownloadModel(
     }
 
     //Done! Rename the file into the right place
-    std::rename(tmpPath.c_str(),path.c_str());
+    try {
+      FileUtils::rename(tmpPath,path);
+      tmpFileRenamed = true;
+    }
+    catch(const IOError& e) {
+      //If the file is already there, some other process downloaded it meanwhile, which is as good
+      //as our own copy. Our tmp file is removed by the guard above.
+      if(!FileUtils::exists(path))
+        throw;
+      logger->write(string("Model file already exists, keeping the existing file. Rename error was: ") + e.what());
+    }
 
     logger->write(string("Done downloading ") + Global::uint64ToString(totalDataSize) + " bytes for model: " + urlToActuallyUse.originalString);
   };
